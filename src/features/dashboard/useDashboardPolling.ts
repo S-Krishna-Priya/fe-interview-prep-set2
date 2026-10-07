@@ -79,32 +79,37 @@ export function useDashboardPolling(
     // slice through React.memo, so an unchanged reference means an unchanged
     // widget skips its re-render even though a sibling slice just updated.
     const applyResult = (result: DashboardData) => {
+      // Decide which slices changed BEFORE touching state, because that
+      // decision mutates `lastSerialized`. React treats a state updater as
+      // pure and may call it more than once for a single update (it does
+      // exactly that in StrictMode); doing the comparison inside the updater
+      // meant the second call saw its own first call's bookkeeping, decided
+      // nothing had changed, and returned `prev` — silently dropping the
+      // update and halving the visible refresh rate.
+      const serializedSales = String(result.sales)
+      const serializedActiveUsers = JSON.stringify(result.activeUsers)
+      const serializedOrders = JSON.stringify(result.recentOrders)
+
+      const salesChanged = serializedSales !== lastSerialized.sales
+      const activeUsersChanged = serializedActiveUsers !== lastSerialized.activeUsers
+      const ordersChanged = serializedOrders !== lastSerialized.recentOrders
+
+      if (!salesChanged && !activeUsersChanged && !ordersChanged) return
+
+      lastSerialized.sales = serializedSales
+      lastSerialized.activeUsers = serializedActiveUsers
+      lastSerialized.recentOrders = serializedOrders
+
+      // Pure: reads only `prev` and the values decided above, so running it
+      // twice produces the same result. A slice whose value did not change
+      // keeps its previous reference, so its memoised widget skips the
+      // re-render even though a sibling slice just updated.
       setSlices((prev) => {
-        let changed = false
         const next: DashboardSlices = { ...prev }
-
-        const serializedSales = String(result.sales)
-        if (serializedSales !== lastSerialized.sales) {
-          lastSerialized.sales = serializedSales
-          next.sales = result.sales
-          changed = true
-        }
-
-        const serializedActiveUsers = JSON.stringify(result.activeUsers)
-        if (serializedActiveUsers !== lastSerialized.activeUsers) {
-          lastSerialized.activeUsers = serializedActiveUsers
-          next.activeUsers = result.activeUsers
-          changed = true
-        }
-
-        const serializedOrders = JSON.stringify(result.recentOrders)
-        if (serializedOrders !== lastSerialized.recentOrders) {
-          lastSerialized.recentOrders = serializedOrders
-          next.recentOrders = result.recentOrders
-          changed = true
-        }
-
-        return changed ? next : prev
+        if (salesChanged) next.sales = result.sales
+        if (activeUsersChanged) next.activeUsers = result.activeUsers
+        if (ordersChanged) next.recentOrders = result.recentOrders
+        return next
       })
     }
 

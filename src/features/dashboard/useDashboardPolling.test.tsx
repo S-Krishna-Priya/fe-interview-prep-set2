@@ -1,4 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DashboardData, FetchDashboardOptions } from './mockApi.ts'
 import { useDashboardPolling } from './useDashboardPolling.ts'
@@ -269,5 +270,48 @@ describe('useDashboardPolling', () => {
     // here means the recent-orders widget would skip its re-render even
     // though the sales widget just updated.
     expect(result.current.recentOrders).toBe(ordersAfterFirstPoll)
+  })
+
+  it('still applies every poll when React double-invokes the state updater', async () => {
+    // StrictMode calls a state updater twice to surface impure updaters.
+    // The bookkeeping that decides which slices changed must therefore live
+    // outside the updater: when it lived inside, the second invocation saw
+    // the first one's bookkeeping, concluded nothing had changed and
+    // returned the previous state — so every poll's data was discarded and
+    // the dashboard refreshed at half the configured rate.
+    // StrictMode also mounts the effect twice, so the first request is
+    // aborted and re-issued; a counter rather than a fixed queue keeps the
+    // test about the refresh rate instead of about which mock came back.
+    let call = 0
+    const fetcher = vi.fn<() => Promise<DashboardData>>().mockImplementation(() => {
+      call += 1
+      return Promise.resolve(makeData({ sales: call }))
+    })
+
+    const { result } = renderHook(() => useDashboardPolling(fetcher, 5000), {
+      wrapper: StrictMode,
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const afterMount = result.current.sales
+    expect(afterMount).not.toBeNull()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000)
+    })
+    const afterFirstPoll = result.current.sales
+    // The bug: this poll's response was fetched but its state update was
+    // discarded, so the value stayed put for a second interval.
+    expect(afterFirstPoll).not.toBe(afterMount)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000)
+    })
+    expect(result.current.sales).not.toBe(afterFirstPoll)
+
+    // One request per interval, and every one of them reached the screen.
+    expect(result.current.sales).toBe(fetcher.mock.calls.length)
   })
 })
