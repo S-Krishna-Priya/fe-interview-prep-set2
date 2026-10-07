@@ -9,6 +9,9 @@
     "lint": "eslint .",
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "test:watch": "vitest",
+    "repo-check": "node scripts/repo-check.mjs",
+    "verify": "npm run typecheck && npm run lint && npm run test && npm run build && npm run repo-check",
     "preview": "vite preview"
   },
   "dependencies": {
