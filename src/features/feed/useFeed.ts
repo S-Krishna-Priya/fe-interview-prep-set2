@@ -14,7 +14,7 @@ interface FeedState {
 
 type FeedAction =
   | { type: 'request-start'; skip: number }
-  | { type: 'request-success'; posts: Post[]; total: number; skip: number }
+  | { type: 'request-success'; posts: Post[]; reachedEnd: boolean }
   | { type: 'request-error'; message: string }
 
 const initialState: FeedState = {
@@ -44,16 +44,17 @@ function feedReducer(state: FeedState, action: FeedAction): FeedState {
         phase: action.skip === 0 ? 'loading' : 'loading-more',
         errorMessage: null,
       }
-    case 'request-success': {
-      const posts = dedupePosts(state.posts, action.posts)
-      const reachedEnd = action.posts.length < PAGE_SIZE || posts.length >= action.total
+    case 'request-success':
+      // `action.posts` is already the merged, deduplicated, "have we
+      // reached the end" list computed by loadPage below — there is a
+      // single place that does this arithmetic, not one in the reducer and
+      // a second, slightly different one next to the fetch call.
       return {
         ...state,
-        posts,
-        phase: reachedEnd ? 'end' : 'idle',
+        posts: action.posts,
+        phase: action.reachedEnd ? 'end' : 'idle',
         errorMessage: null,
       }
-    }
     case 'request-error':
       return {
         ...state,
@@ -81,16 +82,31 @@ export interface UseFeedResult extends FeedState {
  * - `requestedSkipsRef` remembers every skip that has been (successfully)
  *   requested, so it is never re-requested even after `inFlightRef` clears.
  * - `reachedEndRef` stops requests once the feed is known to be exhausted.
- * - `dedupePosts` is a last line of defence: even if the API ever returned
- *   an overlapping page, posts are merged by id.
+ * - `postsRef`/`dedupePosts` merge each page synchronously, by id, so even
+ *   an overlapping API page can never render (or count towards "end") twice.
+ *
+ * StrictMode (src/main.tsx) mounts, cleans up, and re-mounts effects
+ * synchronously in development, which aborts the very first fetch before it
+ * can resolve. Because `inFlightRef` is only cleared inside a `.finally()`
+ * that cannot run until the microtask queue drains — after the remount has
+ * already happened — the remount's call to `loadPage(0)` would otherwise see
+ * a guard that is stuck "in flight" forever. The unmount cleanup below
+ * clears `inFlightRef`/`requestedSkipsRef` synchronously for exactly the
+ * request it just aborted, so the remount can re-issue it. `loadPage`'s own
+ * `.finally()` only touches those refs when it is still the current request
+ * (`abortControllerRef.current === controller`), so the aborted request's
+ * very-late `.finally()` can't stomp on the real, still-in-flight remount
+ * request.
  */
 export function useFeed(): UseFeedResult {
   const [state, dispatch] = useReducer(feedReducer, initialState)
 
   const nextSkipRef = useRef(0)
   const inFlightRef = useRef(false)
+  const inFlightSkipRef = useRef<number | null>(null)
   const requestedSkipsRef = useRef(new Set<number>())
   const reachedEndRef = useRef(false)
+  const postsRef = useRef<Post[]>([])
   const phaseRef = useRef<FeedPhase>(state.phase)
   const mountedRef = useRef(true)
   const abortControllerRef = useRef<AbortController | null>(null)
@@ -101,9 +117,26 @@ export function useFeed(): UseFeedResult {
 
   useEffect(() => {
     mountedRef.current = true
+    // `requestedSkipsRef.current` is the one Set instance for this hook's
+    // whole lifetime (mutated in place, never reassigned), so capturing it
+    // here and using it in the cleanup below still sees its live contents.
+    const requestedSkips = requestedSkipsRef.current
+
     return () => {
       mountedRef.current = false
-      abortControllerRef.current?.abort()
+
+      const controller = abortControllerRef.current
+      if (controller) {
+        controller.abort()
+        // See the function doc comment: reset synchronously, not in a
+        // `.finally()`, so an immediate remount can re-request this page.
+        inFlightRef.current = false
+        const inFlightSkip = inFlightSkipRef.current
+        if (inFlightSkip !== null) {
+          requestedSkips.delete(inFlightSkip)
+          inFlightSkipRef.current = null
+        }
+      }
     }
   }, [])
 
@@ -114,6 +147,7 @@ export function useFeed(): UseFeedResult {
 
     requestedSkipsRef.current.add(skip)
     inFlightRef.current = true
+    inFlightSkipRef.current = skip
     dispatch({ type: 'request-start', skip })
 
     const controller = new AbortController()
@@ -123,10 +157,14 @@ export function useFeed(): UseFeedResult {
       .then((data) => {
         if (!mountedRef.current) return
         nextSkipRef.current = skip + PAGE_SIZE
-        if (data.posts.length < PAGE_SIZE || skip + data.posts.length >= data.total) {
+
+        const mergedPosts = dedupePosts(postsRef.current, data.posts)
+        postsRef.current = mergedPosts
+        const reachedEnd = data.posts.length < PAGE_SIZE || mergedPosts.length >= data.total
+        if (reachedEnd) {
           reachedEndRef.current = true
         }
-        dispatch({ type: 'request-success', posts: data.posts, total: data.total, skip })
+        dispatch({ type: 'request-success', posts: mergedPosts, reachedEnd })
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return
@@ -137,7 +175,14 @@ export function useFeed(): UseFeedResult {
         dispatch({ type: 'request-error', message })
       })
       .finally(() => {
-        inFlightRef.current = false
+        // Only clear the guard if this request is still the current one.
+        // An aborted request whose unmount cleanup already handed the guard
+        // to a newer (remounted) request must not clear it out from under
+        // that newer request once this stale `.finally()` eventually runs.
+        if (abortControllerRef.current === controller) {
+          inFlightRef.current = false
+          inFlightSkipRef.current = null
+        }
       })
   }, [])
 
