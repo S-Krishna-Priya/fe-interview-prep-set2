@@ -23,13 +23,20 @@ const INITIAL_SLICES: DashboardSlices = { sales: null, activeUsers: [], recentOr
  * still be in flight when the next tick fires, so requests start overlapping
  * and can pile up indefinitely. Instead each cycle schedules its own
  * `setTimeout` only once the current request has settled (success or
- * failure), so there is at most one request in flight for the periodic poll.
+ * failure), so the periodic poll by itself never has more than one request
+ * in flight.
  *
- * A second request can still be started early by a visibility resume (to
- * refresh promptly after the tab comes back), which is why every response
- * carries a monotonically increasing request id: a response is only applied
- * if it is still the most recently issued request, so a slow, late response
- * can never clobber newer data already on screen.
+ * A visibility resume is the one case that can interrupt an in-flight
+ * request early (to refresh promptly as soon as the tab comes back): it
+ * aborts whatever request is still outstanding via the fetcher's
+ * `AbortSignal` and immediately starts a new one, so the superseded request
+ * is being cancelled rather than left running concurrently. Every request
+ * also carries a monotonically increasing id: a response — or a superseded
+ * request's own rejection — is only applied, and only allowed to reschedule
+ * the next poll, when it is still the most recently issued request. That
+ * guards two things: a slow, late response can never clobber newer data
+ * already on screen, and a superseded request settling late can never push
+ * the next poll's countdown further out.
  */
 export function useDashboardPolling(
   fetcher: DashboardFetcher = fetchDashboard,
@@ -52,6 +59,7 @@ export function useDashboardPolling(
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
     let requestId = 0
+    let currentController: AbortController | null = null
     const lastSerialized = { sales: '', activeUsers: '', recentOrders: '' }
     let hasUnmounted = false
     // Read through a function (rather than the closured boolean directly) so
@@ -112,20 +120,31 @@ export function useDashboardPolling(
       if (isUnmounted()) return
       requestId += 1
       const id = requestId
+      const controller = new AbortController()
+      currentController = controller
       try {
-        const result = await fetcherRef.current()
+        const result = await fetcherRef.current({ signal: controller.signal })
         if (isUnmounted() || id !== requestId) return
         applyResult(result)
       } catch {
-        // Ignore fetch failures (including aborts); the next poll retries.
+        // Ignore fetch failures, including the rejection a superseded
+        // request gets from being aborted below; whichever request is still
+        // current is the only one allowed to reschedule (see finally).
       } finally {
-        if (!isUnmounted()) scheduleNext()
+        // Only the request that is still current may reschedule the next
+        // poll — a superseded request settling late must not reset the
+        // countdown a second time.
+        if (!isUnmounted() && id === requestId) scheduleNext()
       }
     }
 
     const handleVisibilityChange = () => {
       clearTimer()
       if (!document.hidden) {
+        // Cancel whatever request is still outstanding before starting a
+        // fresh one, so a resume can never leave two requests genuinely
+        // running concurrently.
+        currentController?.abort()
         void runFetch()
       }
     }
@@ -136,6 +155,7 @@ export function useDashboardPolling(
     return () => {
       hasUnmounted = true
       clearTimer()
+      currentController?.abort()
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [])
