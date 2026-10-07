@@ -1,0 +1,189 @@
+import { act, renderHook } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DashboardData } from './mockApi.ts'
+import { useDashboardPolling } from './useDashboardPolling.ts'
+
+function makeData(overrides: Partial<DashboardData> = {}): DashboardData {
+  return {
+    sales: 100,
+    activeUsers: [1, 2, 3],
+    recentOrders: [],
+    ...overrides,
+  }
+}
+
+function setHidden(hidden: boolean) {
+  Object.defineProperty(document, 'hidden', {
+    configurable: true,
+    get: () => hidden,
+  })
+  document.dispatchEvent(new Event('visibilitychange'))
+}
+
+describe('useDashboardPolling', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    setHidden(false)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('fetches on mount and refreshes every 5 seconds', async () => {
+    const fetcher = vi
+      .fn<() => Promise<DashboardData>>()
+      .mockResolvedValueOnce(makeData({ sales: 1 }))
+      .mockResolvedValueOnce(makeData({ sales: 2 }))
+
+    const { result } = renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.sales).toBe(1)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000)
+    })
+    expect(result.current.sales).toBe(2)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops polling while the tab is hidden and resumes once visible again', async () => {
+    const fetcher = vi.fn<() => Promise<DashboardData>>().mockResolvedValue(makeData())
+    renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      setHidden(true)
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      setHidden(false)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('never has more than one request in flight when the API is slow', async () => {
+    const fetcher = vi.fn<() => Promise<DashboardData>>().mockImplementation(
+      () => new Promise<DashboardData>(() => undefined),
+    )
+
+    renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    // The in-flight request above never resolves, so no further poll should
+    // ever be scheduled even across many intervals.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let a stale, late response overwrite newer data', async () => {
+    let resolveFirst: ((data: DashboardData) => void) | undefined
+    let callCount = 0
+    const fetcher = vi.fn<() => Promise<DashboardData>>().mockImplementation(() => {
+      callCount += 1
+      if (callCount === 1) {
+        return new Promise<DashboardData>((resolve) => {
+          resolveFirst = resolve
+        })
+      }
+      return Promise.resolve(makeData({ sales: 2 }))
+    })
+
+    const { result } = renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    // The mount-triggered first request is now in flight and slow.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.sales).toBeNull()
+
+    // A visibility resume issues a second, newer request that resolves fast.
+    await act(async () => {
+      setHidden(false)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.sales).toBe(2)
+
+    // The slow first request finally resolves; it must be dropped as stale.
+    await act(async () => {
+      resolveFirst?.(makeData({ sales: 1 }))
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.sales).toBe(2)
+  })
+
+  it('clears the timer and removes the visibilitychange listener on unmount', async () => {
+    const addSpy = vi.spyOn(document, 'addEventListener')
+    const removeSpy = vi.spyOn(document, 'removeEventListener')
+    const fetcher = vi.fn<() => Promise<DashboardData>>().mockResolvedValue(makeData())
+
+    const { unmount } = renderHook(() => useDashboardPolling(fetcher, 5000))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    const registeredHandler = addSpy.mock.calls.find(([event]) => event === 'visibilitychange')?.[1]
+    expect(registeredHandler).toBeDefined()
+
+    unmount()
+
+    expect(removeSpy).toHaveBeenCalledWith('visibilitychange', registeredHandler)
+
+    const callsSoFar = fetcher.mock.calls.length
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(callsSoFar)
+
+    addSpy.mockRestore()
+    removeSpy.mockRestore()
+  })
+
+  it('keeps a slice reference stable across polls when its value is unchanged', async () => {
+    const sameOrders = [
+      { id: 'o1', customer: 'Ada Lovelace', amount: 42, placedAt: '2024-01-01T00:00:00.000Z' },
+    ]
+    const fetcher = vi
+      .fn<() => Promise<DashboardData>>()
+      .mockResolvedValueOnce(makeData({ sales: 1, recentOrders: sameOrders }))
+      // A fresh array instance with identical content: only `sales` actually changed.
+      .mockResolvedValueOnce(makeData({ sales: 2, recentOrders: [...sameOrders] }))
+
+    const { result } = renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const ordersAfterFirstPoll = result.current.recentOrders
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000)
+    })
+
+    expect(result.current.sales).toBe(2)
+    // Widgets receive their own slice via React.memo; an unchanged reference
+    // here means the recent-orders widget would skip its re-render even
+    // though the sales widget just updated.
+    expect(result.current.recentOrders).toBe(ordersAfterFirstPoll)
+  })
+})
