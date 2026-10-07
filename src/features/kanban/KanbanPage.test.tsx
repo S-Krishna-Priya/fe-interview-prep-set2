@@ -1,6 +1,7 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test } from 'vitest'
+import type { DragTransferLike } from './dragPayload.ts'
 import KanbanPage from './KanbanPage.tsx'
 
 const STORAGE_KEY = 'kanban-board'
@@ -11,6 +12,38 @@ beforeEach(() => {
 
 function getColumn(name: RegExp) {
   return screen.getByRole('region', { name })
+}
+
+async function addCard(column: HTMLElement, title: string) {
+  const user = userEvent.setup()
+  await user.type(within(column).getByLabelText('Title'), title)
+  await user.click(within(column).getByRole('button', { name: /^Add card to /i }))
+}
+
+function getCardItem(column: HTMLElement, title: string): HTMLElement {
+  const heading = within(column).getByRole('heading', { name: title, level: 3 })
+  const item = heading.closest('li')
+  if (!item) throw new Error(`card list item for "${title}" not found`)
+  return item
+}
+
+/**
+ * jsdom doesn't implement the DataTransfer interface (see
+ * https://github.com/jsdom/jsdom/issues/1568), so drag-and-drop tests use
+ * this minimal stub instead of `new DataTransfer()`. Testing Library detects
+ * that `window.DataTransfer` isn't a constructor and attaches this object to
+ * the simulated event's `dataTransfer` property as-is.
+ */
+function createDataTransfer(): DragTransferLike {
+  const store = new Map<string, string>()
+  return {
+    setData(format: string, data: string) {
+      store.set(format, data)
+    },
+    getData(format: string) {
+      return store.get(format) ?? ''
+    },
+  }
 }
 
 test('adds a card with a title, and rejects an empty title', async () => {
@@ -110,6 +143,50 @@ test('reorders cards within a column using move up and move down', async () => {
 
   headings = within(todoColumn).getAllByRole('heading', { level: 3 })
   expect(headings.map((heading) => heading.textContent)).toEqual(['First', 'Second'])
+})
+
+test('reorders cards via drag-and-drop when dragging a card forward (down the list)', async () => {
+  render(<KanbanPage />)
+  const todoColumn = getColumn(/^To do/)
+
+  await addCard(todoColumn, 'A')
+  await addCard(todoColumn, 'B')
+  await addCard(todoColumn, 'C')
+
+  const cardA = getCardItem(todoColumn, 'A')
+  const cardC = getCardItem(todoColumn, 'C')
+  const dataTransfer = createDataTransfer()
+
+  // Drag A and drop it on C: A sits before B in the array, so removing it
+  // shifts C's slot down by one - the insert index must account for that.
+  fireEvent.dragStart(cardA, { dataTransfer })
+  fireEvent.dragOver(cardC, { dataTransfer })
+  fireEvent.drop(cardC, { dataTransfer })
+
+  const headings = within(todoColumn).getAllByRole('heading', { level: 3 })
+  expect(headings.map((heading) => heading.textContent)).toEqual(['B', 'A', 'C'])
+})
+
+test('reorders cards via drag-and-drop when dragging a card backward (up the list)', async () => {
+  render(<KanbanPage />)
+  const todoColumn = getColumn(/^To do/)
+
+  await addCard(todoColumn, 'A')
+  await addCard(todoColumn, 'B')
+  await addCard(todoColumn, 'C')
+
+  const cardA = getCardItem(todoColumn, 'A')
+  const cardC = getCardItem(todoColumn, 'C')
+  const dataTransfer = createDataTransfer()
+
+  // Drag C and drop it on A: C sits after A, so A's index is unaffected by
+  // the removal - this direction already worked before the fix.
+  fireEvent.dragStart(cardC, { dataTransfer })
+  fireEvent.dragOver(cardA, { dataTransfer })
+  fireEvent.drop(cardA, { dataTransfer })
+
+  const headings = within(todoColumn).getAllByRole('heading', { level: 3 })
+  expect(headings.map((heading) => heading.textContent)).toEqual(['C', 'A', 'B'])
 })
 
 test('persists the board across a remount', async () => {

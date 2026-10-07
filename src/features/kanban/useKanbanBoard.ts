@@ -61,11 +61,18 @@ export function useKanbanBoard(): UseKanbanBoardResult {
       const sourceWithoutCard = [...sourceCards.slice(0, cardIndex), ...sourceCards.slice(cardIndex + 1)]
 
       if (from === to) {
-        const insertAt = Math.max(0, Math.min(toIndex ?? sourceWithoutCard.length, sourceWithoutCard.length))
+        // `toIndex` (when given) is the drop target's position in the ORIGINAL
+        // array, which still contains the dragged card. Once that card is
+        // removed, every slot after it shifts down by one, so the insertion
+        // point needs the same adjustment whenever the card moved forward.
+        const requestedIndex = toIndex ?? sourceWithoutCard.length
+        const insertAt =
+          toIndex !== undefined && cardIndex < toIndex ? requestedIndex - 1 : requestedIndex
+        const clampedInsertAt = Math.max(0, Math.min(insertAt, sourceWithoutCard.length))
         const reordered = [
-          ...sourceWithoutCard.slice(0, insertAt),
+          ...sourceWithoutCard.slice(0, clampedInsertAt),
           card,
-          ...sourceWithoutCard.slice(insertAt),
+          ...sourceWithoutCard.slice(clampedInsertAt),
         ]
         return { ...prev, [from]: reordered }
       }
