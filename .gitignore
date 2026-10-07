@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Build caches (kept out of the junctioned node_modules so worktrees do not share them)
+.cache
