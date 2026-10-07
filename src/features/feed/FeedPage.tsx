@@ -1,26 +1,64 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router'
 import { useFeed } from './useFeed.ts'
 
-// Keyed by route so other pages don't collide with it.
-const SCROLL_POSITION_KEY = 'feed:scroll-position'
+// Keyed by route so other pages don't collide with them.
+const SCROLL_Y_KEY = 'feed:scroll-y'
+const SCROLL_POST_COUNT_KEY = 'feed:scroll-post-count'
+
+interface SavedScroll {
+  scrollY: number
+  postCount: number
+}
+
+function readSavedScroll(): SavedScroll | null {
+  try {
+    const scrollYRaw = sessionStorage.getItem(SCROLL_Y_KEY)
+    const postCountRaw = sessionStorage.getItem(SCROLL_POST_COUNT_KEY)
+    if (scrollYRaw === null || postCountRaw === null) return null
+
+    const scrollY = Number(scrollYRaw)
+    const postCount = Number(postCountRaw)
+    if (Number.isNaN(scrollY) || Number.isNaN(postCount)) return null
+
+    return { scrollY, postCount }
+  } catch {
+    return null
+  }
+}
 
 export default function FeedPage() {
   const { posts, phase, errorMessage, loadNextPage, retry } = useFeed()
   const sentinelRef = useRef<HTMLDivElement | null>(null)
+  const postsLengthRef = useRef(posts.length)
   const hasRestoredScrollRef = useRef(false)
+  const [savedScroll] = useState(readSavedScroll)
+
+  // Refs are read in the unmount cleanup below, not during render, so keep
+  // this one current via an effect rather than writing to it in the render
+  // body.
+  useEffect(() => {
+    postsLengthRef.current = posts.length
+  }, [posts.length])
 
   // Scroll restoration, kept deliberately simple: we don't hook into the
-  // router's navigation events. We just persist window.scrollY to
-  // sessionStorage whenever this page unmounts (i.e. the user navigated to a
-  // post, or anywhere else), and restore it once, the first time the list
-  // has posts to scroll through. Reading/writing sessionStorage is wrapped
-  // so a disabled/unavailable storage (e.g. private browsing) degrades
-  // silently instead of crashing the page.
+  // router's navigation events. We persist window.scrollY *and* how many
+  // posts were loaded to sessionStorage whenever this page unmounts (i.e.
+  // the user navigated to a post, or anywhere else). The list only grows
+  // back to that same height once it has reloaded that same amount of
+  // content, so restoring scrollY as soon as the first page renders would
+  // land on the wrong spot (the short, freshly-mounted document just clamps
+  // it to its own max scroll). So below, the feed keeps auto-loading pages
+  // past whatever the sentinel alone would trigger, until it has caught
+  // back up to the saved post count, and only then restores the scroll
+  // position. Storage access is wrapped so a disabled/unavailable
+  // sessionStorage (e.g. private browsing) degrades silently instead of
+  // crashing the page.
   useEffect(() => {
     return () => {
       try {
-        sessionStorage.setItem(SCROLL_POSITION_KEY, String(window.scrollY))
+        sessionStorage.setItem(SCROLL_Y_KEY, String(window.scrollY))
+        sessionStorage.setItem(SCROLL_POST_COUNT_KEY, String(postsLengthRef.current))
       } catch {
         // sessionStorage unavailable; nothing to restore next time either.
       }
@@ -29,18 +67,32 @@ export default function FeedPage() {
 
   useEffect(() => {
     if (hasRestoredScrollRef.current) return
+    if (!savedScroll) {
+      hasRestoredScrollRef.current = true
+      return
+    }
     if (posts.length === 0) return
+
+    const caughtUp = posts.length >= savedScroll.postCount
+    const stuck = phase === 'error' || phase === 'end'
+
+    if (!caughtUp) {
+      if (phase === 'idle') {
+        loadNextPage()
+      }
+      // Keep waiting unless the feed can never catch up on its own (an
+      // error with no auto-retry, or genuinely fewer posts than before) —
+      // then fall through and restore with whatever did load.
+      if (!stuck) return
+    }
 
     hasRestoredScrollRef.current = true
     try {
-      const saved = sessionStorage.getItem(SCROLL_POSITION_KEY)
-      if (saved !== null) {
-        window.scrollTo(0, Number(saved))
-      }
+      window.scrollTo(0, savedScroll.scrollY)
     } catch {
-      // sessionStorage unavailable; start at the top like a fresh visit.
+      // scrollTo unavailable; nothing more we can do.
     }
-  }, [posts.length])
+  }, [posts.length, phase, savedScroll, loadNextPage])
 
   useEffect(() => {
     const node = sentinelRef.current
@@ -74,6 +126,7 @@ export default function FeedPage() {
             <li key={post.id}>
               <Link
                 to={`/feed/${String(post.id)}`}
+                aria-label={post.title}
                 className="block rounded-md border border-slate-200 bg-white p-4 hover:border-slate-400"
               >
                 <h2 className="text-lg font-medium">{post.title}</h2>

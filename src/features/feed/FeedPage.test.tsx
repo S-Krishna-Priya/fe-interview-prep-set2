@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { StrictMode } from 'react'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import FeedPage from './FeedPage.tsx'
 import type { Post, PostsPageResponse } from './types.ts'
@@ -49,12 +50,27 @@ function errorResponse(status: number): Response {
   return new Response(null, { status })
 }
 
+/** Stands in for the post detail page: just enough to navigate back from. */
+function GoBackButton() {
+  const navigate = useNavigate()
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        void navigate(-1)
+      }}
+    >
+      go back
+    </button>
+  )
+}
+
 function renderFeedPage() {
   return render(
     <MemoryRouter initialEntries={['/feed']}>
       <Routes>
         <Route path="/feed" element={<FeedPage />} />
-        <Route path="/feed/:id" element={<p>post detail</p>} />
+        <Route path="/feed/:id" element={<GoBackButton />} />
       </Routes>
     </MemoryRouter>,
   )
@@ -67,9 +83,31 @@ function latestObserver(): MockIntersectionObserver {
   return observer
 }
 
+// jsdom's window.scrollY is a getter with no setter, and its window.scrollTo
+// is an unimplemented stub — redefine both so scroll-restoration tests can
+// observe and drive them like a real browser would.
+let currentScrollY = 0
+let scrollToMock: ReturnType<typeof vi.fn>
+
 beforeEach(() => {
+  // A previous test's FeedPage can still be unmounting (running its
+  // save-scroll-on-unmount cleanup) when ITS afterEach runs, depending on
+  // hook ordering — so clear sessionStorage here too, not just in
+  // afterEach, to guarantee every test starts with nothing saved.
+  sessionStorage.clear()
+
   MockIntersectionObserver.instances = []
   vi.stubGlobal('IntersectionObserver', MockIntersectionObserver)
+
+  currentScrollY = 0
+  Object.defineProperty(window, 'scrollY', {
+    configurable: true,
+    get: () => currentScrollY,
+  })
+  scrollToMock = vi.fn((_x: number, y: number) => {
+    currentScrollY = y
+  })
+  window.scrollTo = scrollToMock as unknown as typeof window.scrollTo
 })
 
 afterEach(() => {
@@ -225,5 +263,103 @@ describe('FeedPage', () => {
     // Further intersections must not trigger any more requests.
     latestObserver().trigger(true)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('still loads posts under StrictMode, which mounts/cleans-up/remounts effects synchronously in dev', async () => {
+    // A fetch mock that behaves like the real thing under AbortController:
+    // once its signal is aborted, the returned promise rejects instead of
+    // ever resolving — unlike a plain mockResolvedValue, which would paper
+    // over the exact bug StrictMode exposes (the aborted request's own
+    // `.then` would otherwise still quietly deliver posts).
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal
+      return new Promise<Response>((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'))
+          return
+        }
+        signal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'))
+        })
+        queueMicrotask(() => {
+          if (!signal?.aborted) {
+            resolve(jsonResponse(makePage(0, 10, 30)))
+          }
+        })
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/feed']}>
+          <Routes>
+            <Route path="/feed" element={<FeedPage />} />
+            <Route path="/feed/:id" element={<GoBackButton />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('link')).toHaveLength(10)
+    })
+    // StrictMode's first attempt is aborted; exactly one more completes it.
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('restores the scroll position only after the feed has reloaded as much content as before', async () => {
+    const page1 = makePage(0, 10, 30)
+    const page2 = makePage(10, 10, 30)
+
+    let resolvePage1Again: ((value: Response) => void) | undefined
+    const page1AgainPromise = new Promise<Response>((resolve) => {
+      resolvePage1Again = resolve
+    })
+    let resolvePage2Again: ((value: Response) => void) | undefined
+    const page2AgainPromise = new Promise<Response>((resolve) => {
+      resolvePage2Again = resolve
+    })
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(page1))
+      .mockResolvedValueOnce(jsonResponse(page2))
+      .mockReturnValueOnce(page1AgainPromise)
+      .mockReturnValueOnce(page2AgainPromise)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const user = userEvent.setup()
+    renderFeedPage()
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('link')).toHaveLength(10)
+    })
+
+    latestObserver().trigger(true)
+    await waitFor(() => {
+      expect(screen.getAllByRole('link')).toHaveLength(20)
+    })
+
+    currentScrollY = 1234
+
+    await user.click(screen.getByRole('link', { name: 'Post 15' }))
+    expect(await screen.findByRole('button', { name: /go back/i })).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: /go back/i }))
+
+    resolvePage1Again?.(jsonResponse(page1))
+    await waitFor(() => {
+      expect(screen.getAllByRole('link')).toHaveLength(10)
+    })
+    // Only 10 of the previous 20 posts are back — restoring scroll against
+    // this much shorter, freshly-mounted list would land in the wrong spot.
+    expect(scrollToMock).not.toHaveBeenCalled()
+
+    resolvePage2Again?.(jsonResponse(page2))
+    await waitFor(() => {
+      expect(scrollToMock).toHaveBeenCalledWith(0, 1234)
+    })
+    expect(screen.getAllByRole('link')).toHaveLength(20)
   })
 })
