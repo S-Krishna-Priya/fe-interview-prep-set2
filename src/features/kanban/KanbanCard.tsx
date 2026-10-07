@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import CardForm from './CardForm.tsx'
 import { readDragPayload, setDragPayload, type DragPayload } from './dragPayload.ts'
 import { COLUMN_ORDER, COLUMN_TITLES, type Card, type ColumnId } from './types.ts'
@@ -14,6 +14,14 @@ interface KanbanCardProps {
   onMoveToColumn: (to: ColumnId) => void
   /** A card was dropped directly on this one; insert it just before this card. */
   onDropBefore: (payload: DragPayload) => void
+  /**
+   * True for the one render where this card has just landed here via a
+   * cross-column move, so its own Edit button can take focus instead of
+   * leaving a keyboard user's focus on the (now-unmounted) button they
+   * pressed in the source column.
+   */
+  autoFocus: boolean
+  onAutoFocusHandled: () => void
 }
 
 const buttonClass = 'rounded border border-slate-300 px-2 py-1 text-xs font-medium hover:bg-slate-100'
@@ -28,9 +36,19 @@ export default function KanbanCard({
   onMoveBy,
   onMoveToColumn,
   onDropBefore,
+  autoFocus,
+  onAutoFocusHandled,
 }: KanbanCardProps) {
   const [isEditing, setIsEditing] = useState(false)
+  const editButtonRef = useRef<HTMLButtonElement>(null)
   const otherColumns = COLUMN_ORDER.filter((id) => id !== columnId)
+
+  useEffect(() => {
+    if (autoFocus) {
+      editButtonRef.current?.focus()
+      onAutoFocusHandled()
+    }
+  }, [autoFocus, onAutoFocusHandled])
 
   if (isEditing) {
     return (
@@ -75,6 +93,7 @@ export default function KanbanCard({
       ) : null}
       <div className="mt-2 flex flex-wrap gap-1">
         <button
+          ref={editButtonRef}
           type="button"
           className={buttonClass}
           onClick={() => {

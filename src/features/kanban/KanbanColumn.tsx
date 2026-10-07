@@ -15,6 +15,9 @@ interface KanbanColumnProps {
   onMoveCardToColumn: (cardId: string, to: ColumnId) => void
   onDropCardBeforeIndex: (cardId: string, from: ColumnId, beforeIndex: number) => void
   onDropCardAtEnd: (cardId: string, from: ColumnId) => void
+  /** The id of the card that just moved here from another column, or null. */
+  focusCardId: string | null
+  onCardFocusHandled: () => void
 }
 
 export default function KanbanColumn({
@@ -28,6 +31,8 @@ export default function KanbanColumn({
   onMoveCardToColumn,
   onDropCardBeforeIndex,
   onDropCardAtEnd,
+  focusCardId,
+  onCardFocusHandled,
 }: KanbanColumnProps) {
   const headingId = useId()
 
@@ -71,6 +76,8 @@ export default function KanbanColumn({
             onDropBefore={(payload) => {
               onDropCardBeforeIndex(payload.cardId, payload.from, index)
             }}
+            autoFocus={card.id === focusCardId}
+            onAutoFocusHandled={onCardFocusHandled}
           />
         ))}
       </ul>

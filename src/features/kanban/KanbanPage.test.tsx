@@ -189,6 +189,20 @@ test('reorders cards via drag-and-drop when dragging a card backward (up the lis
   expect(headings.map((heading) => heading.textContent)).toEqual(['C', 'A', 'B'])
 })
 
+test('keeps focus on the moved card after a cross-column keyboard move', async () => {
+  const user = userEvent.setup()
+  render(<KanbanPage />)
+  const todoColumn = getColumn(/^To do/)
+  const inProgressColumn = getColumn(/^In progress/)
+
+  await addCard(todoColumn, 'Focus me')
+
+  const moveButton = within(todoColumn).getByRole('button', { name: 'Move "Focus me" to In progress' })
+  await user.click(moveButton)
+
+  expect(within(inProgressColumn).getByRole('button', { name: 'Edit "Focus me"' })).toHaveFocus()
+})
+
 test('persists the board across a remount', async () => {
   const user = userEvent.setup()
   const { unmount } = render(<KanbanPage />)
