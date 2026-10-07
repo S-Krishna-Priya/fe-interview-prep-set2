@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DashboardData } from './mockApi.ts'
+import type { DashboardData, FetchDashboardOptions } from './mockApi.ts'
 import { useDashboardPolling } from './useDashboardPolling.ts'
 
 function makeData(overrides: Partial<DashboardData> = {}): DashboardData {
@@ -130,6 +130,90 @@ describe('useDashboardPolling', () => {
       await vi.advanceTimersByTimeAsync(0)
     })
     expect(result.current.sales).toBe(2)
+  })
+
+  it('aborts an outstanding request instead of letting it run concurrently when a resume races it', async () => {
+    const signals: AbortSignal[] = []
+    let callCount = 0
+    const fetcher = vi
+      .fn<(options?: FetchDashboardOptions) => Promise<DashboardData>>()
+      .mockImplementation((options) => {
+        callCount += 1
+        if (options?.signal) signals.push(options.signal)
+        if (callCount === 1) {
+          // Never settles on its own; only an abort can end it.
+          return new Promise<DashboardData>(() => undefined)
+        }
+        return Promise.resolve(makeData({ sales: 2 }))
+      })
+
+    const { result } = renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(signals[0]?.aborted).toBe(false)
+
+    // A resume races the still-pending first request.
+    await act(async () => {
+      setHidden(false)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    // The first request was cancelled rather than left running alongside the
+    // second: only one request is ever truly in flight.
+    expect(signals[0]?.aborted).toBe(true)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(result.current.sales).toBe(2)
+  })
+
+  it('does not let a superseded request reschedule the next poll', async () => {
+    let resolveFirst: ((data: DashboardData) => void) | undefined
+    let callCount = 0
+    const fetcher = vi
+      .fn<(options?: FetchDashboardOptions) => Promise<DashboardData>>()
+      .mockImplementation(() => {
+        callCount += 1
+        if (callCount === 1) {
+          return new Promise<DashboardData>((resolve) => {
+            resolveFirst = resolve
+          })
+        }
+        if (callCount === 2) return Promise.resolve(makeData({ sales: 2 }))
+        return Promise.resolve(makeData({ sales: 3 }))
+      })
+
+    renderHook(() => useDashboardPolling(fetcher, 5000))
+
+    // Request 1 (mount) is slow and still pending.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    // Request 2 (resume) supersedes it and resolves immediately, scheduling
+    // the next poll for 5s from this point.
+    await act(async () => {
+      setHidden(false)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    // Some time passes, then the stale request 1 finally settles late.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+      resolveFirst?.(makeData({ sales: 1 }))
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    // It must not have reset the countdown: still no third request yet.
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    // Advancing the remaining 3s (5s total since request 2 resolved) should
+    // trigger the next poll right on schedule, not later.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(fetcher).toHaveBeenCalledTimes(3)
   })
 
   it('clears the timer and removes the visibilitychange listener on unmount', async () => {
